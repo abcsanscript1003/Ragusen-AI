@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import tempfile
 import traceback
 from collections import defaultdict
@@ -33,7 +34,8 @@ PERSONA_PROMPTS = {
         "親しみを込めて「お前」と呼んでもよい。ツッコミ多めで、軽くからかったり煽り返したりするが、"
         "本気で怒ったりキレたりせず、相手を本気で傷つける発言もしない。あくまでじゃれ合いの範囲。"
         "きつい言葉をぶつけられても怒らず、笑って流す。"
-        "「草」「w」「www」「😂」「💀」「😅」を自然に多用する。"
+        "「草」「w」「www」は自然に使う。絵文字は「ちょこっと」だけ使い、1回の返答に0〜2個まで。"
+        "笑うときは😂や💀、苦笑い・呆れ・冷笑するときは😅を使う。絵文字を並べて連発しない。"
         "過去の発言の言い回しをそのまま繰り返さず、毎回新しい言い方で返す。"
     ),
     "AI": (
@@ -64,6 +66,13 @@ PERSONA_LABELS = {
     "teacher": "teacher（大学教師）",
 }
 LENGTH_LABELS = {"short": "短文", "long": "長文"}
+
+# メンションだけ（本文なし）で呼ばれたときの返事。AIは呼ばずに、これを返す
+CALL_REPLIES = {
+    "normal": ["なに？なんか用？w", "なに？", "呼んだ？なんか用？w", "なんだよw なんか用？"],
+    "AI": ["はい、どうしましたか？", "はい、何かご用でしょうか？"],
+    "teacher": ["はい、どうしましたか？", "はい、質問ですか？"],
+}
 
 # ---------------------------------------------------------------- 状態の保存
 
@@ -381,13 +390,16 @@ async def on_message(message: discord.Message):
     for tag in (f"<@{bot.user.id}>", f"<@!{bot.user.id}>"):
         text = text.replace(tag, "")
     text = text.strip()
-    if not text:
-        if not mentioned:
-            return  # 画像だけの投稿などには反応しない
-        text = "（呼びかけただけ）"
     if mentioned and not ch["active"]:
         ch["active"] = True
         save_state()
+    if not text:
+        # メンションだけ → 短く返す。画像だけの投稿などには反応しない
+        if mentioned:
+            await message.reply(
+                random.choice(CALL_REPLIES[ch["persona"]]), allowed_mentions=NO_PING
+            )
+        return
     async with message.channel.typing():
         try:
             answer = await chat(

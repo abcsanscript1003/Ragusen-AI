@@ -5,6 +5,7 @@ import random
 import tempfile
 import traceback
 from collections import defaultdict
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -182,6 +183,26 @@ def build_messages(history: list) -> list[dict]:
     return msgs
 
 
+PROVIDER_LABELS = {"gemini": "Gemini", "groq": "Groq", "cerebras": "Cerebras"}
+last_used: dict = {"name": None}  # 最後に答えたAI（/statusで表示）
+
+
+def configured_providers() -> list[str]:
+    """キーが設定されているAI。"""
+    return [p for p in PROVIDER_LABELS if p in clients or (p == "gemini" and gemini)]
+
+
+def active_providers() -> list[str]:
+    """/setapiで決めた順番（なければ初期の順番）。キーのないAIは飛ばす。"""
+    saved = state.get("_settings", {}).get("provider_order")
+    order = saved or PROVIDER_ORDER
+    return [p for p in order if p in configured_providers()]
+
+
+def order_text() -> str:
+    return " → ".join(PROVIDER_LABELS[p] for p in active_providers()) or "なし"
+
+
 async def call_gemini(system: str, messages: list[dict], max_tokens: int) -> str:
     contents = [
         types.Content(
@@ -214,7 +235,7 @@ async def call_openai_compat(
 async def call_ai(system: str, messages: list[dict], max_tokens: int) -> str:
     """設定済みのAIを順番に試す。制限やエラーなら次のAIに切り替える。"""
     last_error: Exception | None = None
-    for name in PROVIDER_ORDER:
+    for name in active_providers():
         try:
             if name == "gemini" and gemini:
                 answer = await call_gemini(system, messages, max_tokens)
@@ -223,6 +244,7 @@ async def call_ai(system: str, messages: list[dict], max_tokens: int) -> str:
             else:
                 continue
             print(f"AI応答: {name}")
+            last_used["name"] = name
             return answer
         except Exception as e:
             print(f"AI失敗: {name}: {type(e).__name__}")
@@ -356,6 +378,47 @@ async def finish(interaction: discord.Interaction):
     )
 
 
+# キーを入れたAIだけを選択肢に出す（Cerebrasのキーがなければ出ない）
+API_CHOICES = [
+    app_commands.Choice(name=PROVIDER_LABELS[p], value=p) for p in configured_providers()
+]
+
+
+@bot.tree.command(
+    name="setapi",
+    description="使うAIの優先順位を変える（上から順に使い、制限に当たったら次へ）",
+)
+@app_commands.describe(first="1番目に使うAI", second="2番目（なくてもOK）")
+@app_commands.choices(first=API_CHOICES, second=API_CHOICES)
+async def setapi(
+    interaction: discord.Interaction,
+    first: app_commands.Choice[str],
+    second: Optional[app_commands.Choice[str]] = None,
+):
+    picked: list[str] = []
+    for c in (first, second):
+        if c is not None and c.value not in picked:
+            picked.append(c.value)
+    available = configured_providers()
+    missing = [p for p in picked if p not in available]
+    if missing:
+        await interaction.response.send_message(
+            "キーが設定されていないAIは選べません: "
+            + "、".join(PROVIDER_LABELS[p] for p in missing)
+            + "\n使えるAI: "
+            + ("、".join(PROVIDER_LABELS[p] for p in available) or "なし"),
+            ephemeral=True,
+        )
+        return
+    # 選ばなかったAIは、あとに足して予備にする
+    order = picked + [p for p in available if p not in picked]
+    state.setdefault("_settings", {})["provider_order"] = order
+    save_state()
+    await interaction.response.send_message(
+        f"AIの優先順位を変更しました（全チャンネル共通）: {order_text()}"
+    )
+
+
 @bot.tree.command(name="forget", description="自分の発言だけを記憶から消す")
 async def forget(interaction: discord.Interaction):
     uid = interaction.user.id
@@ -388,6 +451,8 @@ async def status(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"人格: {PERSONA_LABELS[ch['persona']]}\n"
         f"長さ: {LENGTH_LABELS[ch['length']]}\n"
+        f"AIの優先順位: {order_text()}\n"
+        f"最後に答えたAI: {PROVIDER_LABELS.get(last_used['name'], 'まだなし')}\n"
         f"自動反応: {'オン（/finishで停止）' if ch['active'] else 'オフ（メンションで開始）'}\n"
         f"記憶している発言数: {count}（上限{MAX_HISTORY}）"
     )

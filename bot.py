@@ -93,6 +93,7 @@ def get_ch(channel_id: int) -> dict:
     ch.setdefault("persona", "normal")
     ch.setdefault("length", "short")
     ch.setdefault("history", [])
+    ch.setdefault("active", False)  # メンション後、/finishまで自動で反応する
     return ch
 
 
@@ -236,6 +237,16 @@ async def reset(interaction: discord.Interaction):
     await interaction.response.send_message("このチャンネルの記憶を消しました。")
 
 
+@bot.tree.command(name="finish", description="このチャンネルでの自動反応を止める（次はメンションで再開）")
+async def finish(interaction: discord.Interaction):
+    ch = get_ch(interaction.channel_id)
+    ch["active"] = False
+    save_state()
+    await interaction.response.send_message(
+        "自動反応を止めました。また呼ぶときはメンションしてください。（記憶は残っています）"
+    )
+
+
 @bot.tree.command(name="forget", description="自分の発言だけを記憶から消す")
 async def forget(interaction: discord.Interaction):
     uid = interaction.user.id
@@ -268,6 +279,7 @@ async def status(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"人格: {PERSONA_LABELS[ch['persona']]}\n"
         f"長さ: {LENGTH_LABELS[ch['length']]}\n"
+        f"自動反応: {'オン（/finishで停止）' if ch['active'] else 'オフ（メンションで開始）'}\n"
         f"記憶している発言数: {count}（上限{MAX_HISTORY}）"
     )
 
@@ -314,10 +326,11 @@ async def translate(
     await send_chunks(interaction, out)
 
 
-@bot.tree.command(name="quiz", description="テーマを指定してクイズを出す（答えはメンションで返信）")
+@bot.tree.command(name="quiz", description="テーマを指定してクイズを出す（答えはそのまま返信）")
 @app_commands.describe(theme="クイズのテーマ")
 async def quiz(interaction: discord.Interaction, theme: str):
     await interaction.response.defer(thinking=True)
+    get_ch(interaction.channel_id)["active"] = True  # 答えに自動で反応できるように
     prompt = (
         f"「{theme}」について、クイズを1問だけ出してください。"
         "答えはまだ言わず、私が答えたら正解かどうかを判定してください。"
@@ -359,13 +372,22 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    # メンションされたとき、またはDMのときだけ反応
-    if not (message.guild is None or bot.user in message.mentions):
+    # DM、メンション、または会話中（/finishまで）のチャンネルで反応
+    ch = get_ch(message.channel.id)
+    mentioned = bot.user in message.mentions
+    if not (message.guild is None or mentioned or ch["active"]):
         return
     text = message.content
     for tag in (f"<@{bot.user.id}>", f"<@!{bot.user.id}>"):
         text = text.replace(tag, "")
-    text = text.strip() or "（呼びかけただけ）"
+    text = text.strip()
+    if not text:
+        if not mentioned:
+            return  # 画像だけの投稿などには反応しない
+        text = "（呼びかけただけ）"
+    if mentioned and not ch["active"]:
+        ch["active"] = True
+        save_state()
     async with message.channel.typing():
         try:
             answer = await chat(

@@ -187,9 +187,21 @@ async def send_chunks(interaction: discord.Interaction, text: str) -> None:
         await interaction.followup.send(c, allowed_mentions=NO_PING)
 
 
+def error_text(e: Exception) -> str:
+    """エラーの種類に応じて、原因が分かる返事にする。"""
+    code = getattr(e, "code", None)
+    if code == 429:
+        return "いまGeminiの無料枠の上限に当たってるみたい。少し待ってからもう一度送ってください。"
+    if code in (500, 502, 503, 504):
+        return "Gemini側が混み合っているみたい。少し待ってからもう一度送ってください。"
+    if code in (400, 401, 403):
+        return "Geminiの設定（キーやモデル名）に問題があるみたい。管理者に伝えてください。"
+    return "エラーが起きました。少し待ってからもう一度試してください。"
+
+
 async def report_error(interaction: discord.Interaction, e: Exception) -> None:
     traceback.print_exc()
-    await interaction.followup.send(f"エラーが起きました（{type(e).__name__}）")
+    await interaction.followup.send(error_text(e))
 
 
 class Bot(discord.Client):
@@ -406,9 +418,9 @@ async def on_message(message: discord.Message):
             answer = await chat(
                 message.channel.id, message.author.id, message.author.display_name, text
             )
-        except Exception:
+        except Exception as e:
             traceback.print_exc()
-            await message.reply("エラーが起きました。少し待ってからもう一度試してください。")
+            await message.reply(error_text(e), allowed_mentions=NO_PING)
             return
     for i, chunk in enumerate(split_text(answer)):
         if i == 0:

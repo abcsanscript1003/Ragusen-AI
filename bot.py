@@ -10,15 +10,53 @@ import discord
 from discord import app_commands
 from google import genai
 from google.genai import types
+from openai import AsyncOpenAI
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-# AI Studioの無料枠で使えるFlash系モデル。名前が変わったらこの環境変数で差し替える
-MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 DATA_DIR = os.getenv("DATA_DIR", ".")  # Railwayでは Volume のパス（例: /data）
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "300"))  # 1チャンネルで覚える最大発言数
+HISTORY_SENT = int(os.getenv("HISTORY_SENT", "30"))  # AIに毎回送る直近の発言数（無料枠の節約）
 
-ai = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# ---------------------------------------------------------------- AIの接続先
+# キーを設定したサービスだけ使う。上から順に試し、制限などで失敗したら次に回す。
+PROVIDER_ORDER = [
+    p.strip().lower()
+    for p in os.getenv("PROVIDER_ORDER", "cerebras,groq,gemini").split(",")
+    if p.strip()
+]
+# 名前が変わったときは、環境変数でモデル名を差し替える
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+OPENAI_COMPAT = {
+    "cerebras": {
+        "key_env": "CEREBRAS_API_KEY",
+        "base_url": "https://api.cerebras.ai/v1",
+        "model": os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
+    },
+    "groq": {
+        "key_env": "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+    },
+}
+
+clients: dict[str, AsyncOpenAI] = {}
+for _name, _d in OPENAI_COMPAT.items():
+    _key = os.getenv(_d["key_env"])
+    if _key:
+        clients[_name] = AsyncOpenAI(api_key=_key, base_url=_d["base_url"], timeout=40)
+
+gemini = (
+    genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    if os.getenv("GEMINI_API_KEY")
+    else None
+)
+
+if not clients and not gemini:
+    raise SystemExit(
+        "AIのキーがありません。GEMINI_API_KEY / GROQ_API_KEY / CEREBRAS_API_KEY のどれかを設定してください。"
+    )
+print("使えるAI:", [p for p in PROVIDER_ORDER if p in clients or (p == "gemini" and gemini)])
 
 # ---------------------------------------------------------------- 人格設定
 
@@ -132,7 +170,7 @@ def build_messages(history: list) -> list[dict]:
     return msgs
 
 
-async def call_ai(system: str, messages: list[dict], max_tokens: int) -> str:
+async def call_gemini(system: str, messages: list[dict], max_tokens: int) -> str:
     contents = [
         types.Content(
             role="model" if m["role"] == "assistant" else "user",
@@ -140,14 +178,47 @@ async def call_ai(system: str, messages: list[dict], max_tokens: int) -> str:
         )
         for m in messages
     ]
-    res = await ai.aio.models.generate_content(
-        model=MODEL,
+    res = await gemini.aio.models.generate_content(
+        model=GEMINI_MODEL,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system, max_output_tokens=max_tokens
         ),
     )
     return (res.text or "").strip() or "…"
+
+
+async def call_openai_compat(
+    name: str, system: str, messages: list[dict], max_tokens: int
+) -> str:
+    res = await clients[name].chat.completions.create(
+        model=OPENAI_COMPAT[name]["model"],
+        max_tokens=max_tokens,
+        messages=[{"role": "system", "content": system}] + messages,
+    )
+    return (res.choices[0].message.content or "").strip() or "…"
+
+
+async def call_ai(system: str, messages: list[dict], max_tokens: int) -> str:
+    """設定済みのAIを順番に試す。制限やエラーなら次のAIに切り替える。"""
+    last_error: Exception | None = None
+    for name in PROVIDER_ORDER:
+        try:
+            if name == "gemini" and gemini:
+                answer = await call_gemini(system, messages, max_tokens)
+            elif name in clients:
+                answer = await call_openai_compat(name, system, messages, max_tokens)
+            else:
+                continue
+            print(f"AI応答: {name}")
+            return answer
+        except Exception as e:
+            print(f"AI失敗: {name}: {type(e).__name__}")
+            traceback.print_exc()
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("使えるAIが設定されていません")
 
 
 async def chat(channel_id: int, author_id: int, author_name: str, text: str) -> str:
@@ -161,7 +232,9 @@ async def chat(channel_id: int, author_id: int, author_name: str, text: str) -> 
         trim(history)
         try:
             answer = await call_ai(
-                system_prompt(ch), build_messages(history), MAX_TOKENS[ch["length"]]
+                system_prompt(ch),
+                build_messages(history[-HISTORY_SENT:]),
+                MAX_TOKENS[ch["length"]],
             )
         except Exception:
             history.pop()  # 失敗した発言は記憶に残さない
@@ -189,13 +262,15 @@ async def send_chunks(interaction: discord.Interaction, text: str) -> None:
 
 def error_text(e: Exception) -> str:
     """エラーの種類に応じて、原因が分かる返事にする。"""
-    code = getattr(e, "code", None)
+    code = getattr(e, "status_code", None)
+    if not isinstance(code, int):
+        code = getattr(e, "code", None)
     if code == 429:
-        return "いまGeminiの無料枠の上限に当たってるみたい。少し待ってからもう一度送ってください。"
+        return "いま無料枠の上限に当たってるみたい。少し待ってからもう一度送ってください。"
     if code in (500, 502, 503, 504):
-        return "Gemini側が混み合っているみたい。少し待ってからもう一度送ってください。"
-    if code in (400, 401, 403):
-        return "Geminiの設定（キーやモデル名）に問題があるみたい。管理者に伝えてください。"
+        return "AI側が混み合っているみたい。少し待ってからもう一度送ってください。"
+    if code in (400, 401, 403, 404):
+        return "AIの設定（キーやモデル名）に問題があるみたい。管理者に伝えてください。"
     return "エラーが起きました。少し待ってからもう一度試してください。"
 
 

@@ -113,9 +113,9 @@ LENGTH_PROMPTS = {
 MAX_TOKENS = {"short": 1024, "long": 3000}
 
 PERSONA_LABELS = {
-    "normal": "normal（AIゆずぴー風）",
-    "AI": "AI（普通のAI）",
-    "teacher": "teacher（大学教師）",
+    "normal": "ノーマル",
+    "AI": "AI",
+    "teacher": "teacher",
 }
 LENGTH_LABELS = {"short": "短文", "long": "長文"}
 
